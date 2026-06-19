@@ -26,6 +26,20 @@ services:
       - DATABASE_URL=postgresql://postgres:password@db:5432/cutover_db
     depends_on:
       - db
+    
+  # streamlit is now at the same level as 'web' and 'db'
+  streamlit:
+    build: .
+    container_name: cutover_streamlit_demo
+    restart: always
+    ports:
+      - "8501:8501"
+    volumes:
+      - .:/code
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@db:5432/cutover_db
+    depends_on:
+      - db
 
 volumes:
   postgres_data:
