@@ -10,3 +10,6 @@ def health_check():
         "project": settings.PROJECT_NAME,
         "message": "Backend engine is up and running!"
     }
+@app.get("/add/{a}/{b}")
+def add(a: int, b: int):
+    return a + b
