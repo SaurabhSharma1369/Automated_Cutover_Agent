@@ -39,6 +39,21 @@ class Task(Base):
     description = Column(Text, nullable=True)
     status = Column(Enum(TaskStatus), default=TaskStatus.PENDING, nullable=False)
     assigned_to = Column(Integer, ForeignKey("users.id"), nullable=False)
+    
+    # 👈 Added to capture the secondary owner email string from Excel
+    secondary_owner_email = Column(String(255), nullable=True)
+    responsible_team = Column(String(255), nullable=True)
+    planned_percentage = Column(Integer, nullable=True)
+    actual_percentage = Column(Integer, nullable=True)
+    variance = Column(Integer, nullable=True)
+    reply_text = Column(Text, nullable=True)
+    completion_percentage = Column(Integer, nullable=True)
+    summary = Column(Text, nullable=True)
+    delay_reason = Column(Text, nullable=True)
+    recovery_plan = Column(Text, nullable=True)
+    expected_completion = Column(DateTime, nullable=True)
+    warning = Column(Text, nullable=True)
+
     deadline = Column(DateTime, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -51,7 +66,10 @@ class EmailLog(Base):
     __tablename__ = "email_logs"
 
     id = Column(Integer, primary_key=True, index=True)
-    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=False)
+    
+    # 👈 Changed to nullable=True so standalone general system alerts don't crash the logger
+    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=True) 
+    
     direction = Column(String(50), nullable=False)  # "INBOUND" or "OUTBOUND"
     sender = Column(String(255), nullable=False)
     recipient = Column(String(255), nullable=False)

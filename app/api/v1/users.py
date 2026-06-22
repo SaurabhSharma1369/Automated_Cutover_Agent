@@ -66,3 +66,30 @@ def get_all_users(db: Session = Depends(get_db)):
     Retrieve all registered users.
     """
     return db.query(User).all()
+
+from app.models.models import Task, AuditLog, EmailLog  # Make sure these are imported at the top
+
+@router.delete("/all", status_code=status.HTTP_204_NO_CONTENT)
+def delete_all_users(db: Session = Depends(get_db)):
+    """
+    Clears out all users from the database. Wipes downstream tasks, 
+    audit logs, and email history first to satisfy foreign key constraints.
+    """
+    try:
+        # 1. Wipe the lowest level dependencies first (Grandchildren)
+        db.query(AuditLog).delete()
+        
+        # 2. Wipe the mid-level task and email dependencies (Children)
+        db.query(EmailLog).delete()
+        db.query(Task).delete()
+        
+        # 3. Finally, clear out the parent users table safely!
+        db.query(User).delete()
+        
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database wipe failed: {str(e)}"
+        )
