@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     SMTP_PORT: int
     SMTP_USERNAME: str
     SMTP_PASSWORD: str
+    IMAP_SERVER: str = "imap.gmail.com"
     GMAIL_API_KEY: str = ""
     GOOGLE_API_KEY: str = ""
     LANGSMITH_TRACING: bool = False

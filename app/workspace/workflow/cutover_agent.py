@@ -4,81 +4,49 @@ from typing import TypedDict, Literal
 from langchain_google_genai import ChatGoogleGenerativeAI
 from pydantic import BaseModel
 from langgraph.graph import StateGraph, END
-from langchain_core.output_parsers import PydanticOutputParser
+
 from app.core.config import settings
-
-
-# =====================================================
-# EMAIL SERVICE
-# =====================================================
-
-def send_email(to_email, subject, body, cc=None):
-
-    print("\n==============================")
-    print("EMAIL SENT")
-    print("==============================")
-    print("TO :", to_email)
-
-    if cc:
-        print("CC :", cc)
-
-    print("SUBJECT :", subject)
-
-    print("BODY :")
-    print(body)
-
-    print("==============================\n")
-
-
-# =====================================================
-# LLM
-# =====================================================
-
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    temperature=0,
-    google_api_key=settings.GOOGLE_API_KEY
-)
-
+from app.core.database import SessionLocal
+from app.models.models import Task, TaskStatus, AuditLog
+from app.workspace.services.email_service import send_email
 
 # =====================================================
 # SCHEMAS
 # =====================================================
 
 class ReplyClassification(BaseModel):
-
     status: Literal[
         "COMPLETED",
         "ON_TRACK",
         "AT_RISK",
         "DELAYED"
     ]
-
-    completion_percentage: int
-
+    actual_percentage: int  # <-- UNIFIED: Matches Excel and DB schema
     summary: str
-
     delay_reason: str
-
     recovery_plan: str
-
     expected_completion: str
 
 
 class EmailOutput(BaseModel):
-
     subject: str
-
     body: str
 
 
-classifier_parser = PydanticOutputParser(
-    pydantic_object=ReplyClassification
+# =====================================================
+# LLMs (STRUCTURED OUTPUTS)
+# =====================================================
+
+# 1. Base Model
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash",
+    temperature=0,
+    google_api_key=settings.GOOGLE_API_KEY
 )
 
-email_parser = PydanticOutputParser(
-    pydantic_object=EmailOutput
-)
+# 2. Specialized Models bound to Pydantic Schemas
+classifier_llm = llm.with_structured_output(ReplyClassification)
+email_llm = llm.with_structured_output(EmailOutput)
 
 
 # =====================================================
@@ -86,35 +54,20 @@ email_parser = PydanticOutputParser(
 # =====================================================
 
 class CutoverState(TypedDict):
-
+    task_id: int            
     task_name: str
-
     assigned_to: str
-
     secondary_owner: str
-
     responsible_team: str
-
     planned_percentage: float
-
-    actual_percentage: float
-
+    actual_percentage: float # <-- Input from DB, overwritten by AI Extraction
     variance: float
-
     reply_text: str
-
     status: str
-
-    completion_percentage: int
-
     summary: str
-
     delay_reason: str
-
     recovery_plan: str
-
     expected_completion: str
-
     warning: str
 
 
@@ -127,54 +80,37 @@ def classify_reply(state: CutoverState):
     prompt = f"""
 You are a Cutover Management AI.
 
-Task:
-{state["task_name"]}
-
-Planned Completion:
-{state["planned_percentage"]}%
-
-Current Completion:
-{state["actual_percentage"]}%
-
-Variance:
-{state["variance"]}
+Task: {state["task_name"]}
+Planned Percentage: {state["planned_percentage"]}%
+Current Database Percentage: {state["actual_percentage"]}%
 
 Employee Update:
-{state["reply_text"]}
+"{state["reply_text"]}"
 
 Determine:
-
 1. COMPLETED
 2. ON_TRACK
 3. AT_RISK
 4. DELAYED
 
-Extract:
-
-status
-completion_percentage
-summary
-delay_reason
-recovery_plan
-expected_completion
-
-{classifier_parser.get_format_instructions()}
+EXTRACTION RULES:
+- actual_percentage: Read the "Employee Update" carefully. If the employee states a new completion percentage (e.g., "90 percent", "50%"), you MUST output that new integer. ONLY if they completely fail to mention a number should you return the Current Database Percentage ({state['actual_percentage']}).
+- status: Classify based on the text.
+- summary: Summarize the update.
+- delay_reason: Extract the reason if delayed.
+- recovery_plan: Extract the plan if provided.
+- expected_completion: Extract the ETA if provided.
 """
 
-    response = llm.invoke(prompt)
-
     try:
-
-        result = classifier_parser.parse(
-            response.content
-        )
+        result = classifier_llm.invoke(prompt)
 
         print("\n===== CLASSIFICATION =====")
         print(result)
 
         return {
             "status": result.status,
-            "completion_percentage": result.completion_percentage,
+            "actual_percentage": result.actual_percentage, # Overwrites old state with new update
             "summary": result.summary,
             "delay_reason": result.delay_reason,
             "recovery_plan": result.recovery_plan,
@@ -182,12 +118,10 @@ expected_completion
         }
 
     except Exception as e:
-
-        print("PARSER ERROR:", e)
-
+        print("LLM/PARSER ERROR:", e)
         return {
             "status": "AT_RISK",
-            "completion_percentage": state["actual_percentage"],
+            "actual_percentage": state["actual_percentage"], # Fallback to existing if parsing fails
             "summary": state["reply_text"],
             "delay_reason": "Unable to parse",
             "recovery_plan": "",
@@ -202,23 +136,14 @@ expected_completion
 def warning_check(state: CutoverState):
 
     warning = ""
-
-    gap = (
-        state["planned_percentage"]
-        - state["completion_percentage"]
-    )
+    # Check gap using the newly extracted actual_percentage
+    gap = state["planned_percentage"] - state["actual_percentage"]
 
     if gap > 20:
-
-        warning = (
-            f"Behind planned progress by {gap}%"
-        )
-
+        warning = f"Behind planned progress by {gap}%"
         print("WARNING:", warning)
 
-    return {
-        "warning": warning
-    }
+    return {"warning": warning}
 
 
 # =====================================================
@@ -228,32 +153,56 @@ def warning_check(state: CutoverState):
 def update_db(state: CutoverState):
 
     print("\n===== UPDATE TRACKER =====")
+    print(f"Task ID: {state['task_id']} | Status: {state['status']} | Actual: {state['actual_percentage']}%")
 
-    print(
-        f"""
-Task: {state["task_name"]}
+    db = SessionLocal()
+    
+    try:
+        task = db.query(Task).filter(Task.id == state["task_id"]).first()
 
-Status: {state["status"]}
+        if task:
+            previous_status = task.status
 
-Completion: {state["completion_percentage"]}%
+            status_map = {
+                "COMPLETED": TaskStatus.DONE,
+                "ON_TRACK": TaskStatus.PENDING,
+                "AT_RISK": TaskStatus.BLOCKED,
+                "DELAYED": TaskStatus.OVERDUE
+            }
 
-ETA: {state["expected_completion"]}
+            # Update the Task record
+            task.status = status_map.get(state["status"], task.status)
+            task.actual_percentage = state["actual_percentage"] # <-- Saves exactly to your DB field
+            
+            if state["delay_reason"] and state["delay_reason"].lower() != "none":
+                task.delay_reason = state["delay_reason"]
+            if state["recovery_plan"] and state["recovery_plan"].lower() != "none":
+                task.recovery_plan = state["recovery_plan"]
+            if state["warning"]:
+                task.warning = state["warning"]
 
-Delay Reason:
-{state["delay_reason"]}
+            # Record the change in the AuditLog
+            audit_entry = AuditLog(
+                task_id=task.id,
+                previous_status=previous_status.value if hasattr(previous_status, "value") else str(previous_status),
+                new_status=task.status.value,
+                changed_by="LangGraph AI",
+                reason_summary=f"AI Tracker Update: {state['summary'][:200]}"
+            )
+            db.add(audit_entry)
 
-Recovery Plan:
-{state["recovery_plan"]}
+            # Commit
+            db.commit()
+            print(f"✅ Successfully updated Task #{task.id} in PostgreSQL.")
+            
+        else:
+            print(f"⚠️ Task ID #{state['task_id']} not found in the database. Skipping DB update.")
 
-Warning:
-{state["warning"]}
-"""
-    )
-
-    # TODO
-    # PostgreSQL update
-    # Excel update
-    # Dashboard update
+    except Exception as e:
+        print(f"❌ Failed to update PostgreSQL: {e}")
+        db.rollback()
+    finally:
+        db.close()
 
     return state
 
@@ -263,10 +212,6 @@ Warning:
 # =====================================================
 
 def followup(state: CutoverState):
-
-    employee_email = state["assigned_to"]
-
-    cc_email = state["secondary_owner"]
 
     prompt = f"""
 You are an Enterprise Cutover Management Assistant.
@@ -279,66 +224,44 @@ Rules:
 - Start the email with exactly:
   Hello,
 - Keep the tone professional and concise.
-- Ask for the required information clearly.
+- Include a bolded note at the bottom (just before the signature) saying: "**IMPORTANT: When replying, please keep the exact subject line intact. The [Task #{state['task_id']}] tag is required to automatically log your update.**"
 - End the email exactly with:
 
 Regards,
 Cutover Agent
 
-Task:
-{state["task_name"]}
+Task: {state["task_name"]}
+Current Actual Percentage: {state["actual_percentage"]}%
+Issue: {state["delay_reason"]}
+Recovery Plan: {state["recovery_plan"]}
 
-Current Completion:
-{state["completion_percentage"]}%
-
-Issue:
-{state["delay_reason"]}
-
-Recovery Plan:
-{state["recovery_plan"]}
-
-Request the following:
-
+Request:
 1. Updated ETA
 2. Remaining blockers
 3. Recovery actions
-4. Current completion percentage
-5. Any support required from dependent teams
-
-{email_parser.get_format_instructions()}
+4. Current actual percentage
 """
 
-    response = llm.invoke(prompt)
-
     try:
-
-        email = email_parser.parse(
-            response.content
-        )
-
+        email = email_llm.invoke(prompt)
         send_email(
-            to_email=employee_email,
-            subject=email.subject,
+            to_email=state["assigned_to"],
+            subject=f"{email.subject} [Task #{state['task_id']}]", 
             body=email.body,
-            cc=cc_email
+            cc=state["secondary_owner"]
         )
-
-        print(
-            f"Follow-up email sent for task: "
-            f"{state['task_name']}"
-        )
-
+        print(f"📧 Follow-up email sent for task ID #{state['task_id']}")
     except Exception as e:
         print("FOLLOWUP EMAIL ERROR:", e)
 
     return state
+
+
 # =====================================================
 # ESCALATION
 # =====================================================
 
 def escalate(state: CutoverState):
-
-    team_dl = state["responsible_team"]
 
     prompt = f"""
 You are an Enterprise Cutover Management Assistant.
@@ -351,29 +274,17 @@ Rules:
 - Start the email with exactly:
   Hello,
 - Keep the email concise and executive-friendly.
-- Clearly highlight the risk, impact, and required action.
+- Include a bolded note at the bottom (just before the signature) saying: "**IMPORTANT: When replying, please keep the exact subject line intact. The [Task #{state['task_id']}] tag is required to automatically log your update.**"
 - End the email exactly with:
 
 Regards,
 Cutover Agent
 
-Task:
-{state["task_name"]}
-
-Current Status:
-{state["status"]}
-
-Completion Percentage:
-{state["completion_percentage"]}%
-
-Delay Reason:
-{state["delay_reason"]}
-
-Recovery Plan:
-{state["recovery_plan"]}
-
-Expected Completion:
-{state["expected_completion"]}
+Task: {state["task_name"]}
+Status: {state["status"]}
+Actual Percentage: {state["actual_percentage"]}%
+Delay Reason: {state["delay_reason"]}
+Recovery Plan: {state["recovery_plan"]}
 
 Provide:
 1. Executive summary
@@ -381,48 +292,32 @@ Provide:
 3. Impact to cutover timeline
 4. Recovery actions underway
 5. Support required from responsible team
-
-{email_parser.get_format_instructions()}
 """
 
-    response = llm.invoke(prompt)
-
     try:
-
-        email = email_parser.parse(
-            response.content
-        )
-
+        email = email_llm.invoke(prompt)
         send_email(
-            to_email=team_dl,
-            subject=email.subject,
+            to_email=state["responsible_team"],
+            subject=f"{email.subject} [Task #{state['task_id']}]",
             body=email.body,
             cc=state["secondary_owner"]
         )
-
-        print(
-            f"Escalation email sent for task: "
-            f"{state['task_name']}"
-        )
-
+        print(f"🚨 Escalation email sent for task ID #{state['task_id']}")
     except Exception as e:
-
         print("ESCALATION EMAIL ERROR:", e)
 
     return state
+
+
 # =====================================================
 # ROUTER
 # =====================================================
 
-def route(state: CutoverState):
-
+def route_after_update(state: CutoverState):
+    """
+    Decides the next step ONLY AFTER the database has been updated.
+    """
     status = state["status"]
-
-    if status == "COMPLETED":
-        return "update"
-
-    if status == "ON_TRACK":
-        return "update"
 
     if status == "AT_RISK":
         return "followup"
@@ -430,7 +325,8 @@ def route(state: CutoverState):
     if status == "DELAYED":
         return "escalate"
 
-    return "update"
+    # For COMPLETED or ON_TRACK, we do nothing else and end the graph.
+    return "end"
 
 
 # =====================================================
@@ -439,51 +335,30 @@ def route(state: CutoverState):
 
 builder = StateGraph(CutoverState)
 
-builder.add_node(
-    "classify",
-    classify_reply
-)
+builder.add_node("classify", classify_reply)
+builder.add_node("warning_check", warning_check)
+builder.add_node("update", update_db)
+builder.add_node("followup", followup)
+builder.add_node("escalate", escalate)
 
-builder.add_node(
-    "warning_check",
-    warning_check
-)
+builder.set_entry_point("classify")
 
-builder.add_node(
-    "update",
-    update_db
-)
+# The Linear Flow (Executes for EVERY task)
+builder.add_edge("classify", "warning_check")
+builder.add_edge("warning_check", "update")
 
-builder.add_node(
-    "followup",
-    followup
-)
-
-builder.add_node(
-    "escalate",
-    escalate
-)
-
-builder.set_entry_point(
-    "classify"
-)
-
-builder.add_edge(
-    "classify",
-    "warning_check"
-)
-
+# The Branching Flow (Executes AFTER the database is saved)
 builder.add_conditional_edges(
-    "warning_check",
-    route,
+    "update",
+    route_after_update,
     {
-        "update": "update",
+        "end": END,
         "followup": "followup",
         "escalate": "escalate"
     }
 )
 
-builder.add_edge("update", END)
+# Both email nodes terminate the graph once they finish sending
 builder.add_edge("followup", END)
 builder.add_edge("escalate", END)
 
@@ -494,51 +369,36 @@ graph = builder.compile()
 # TEST
 # =====================================================
 
-initial_state = {
+if __name__ == "__main__":
+    initial_state = {
+        "task_id": 42,
+        "task_name": "Database Migration",
+        "assigned_to": "jitendra@company.com",
+        "secondary_owner": "backup.owner@company.com",
+        "responsible_team": "database-team@company.com",
+        "planned_percentage": 100,
+        "actual_percentage": 75, # Starts at 75 from DB
+        "variance": 25,
+        "reply_text": """
+    Task is 85% complete.
 
-    "task_name": "Database Migration",
+    Waiting for security approval.
 
-    "assigned_to": "jitendra@company.com",
+    Expected completion by 5 PM.
 
-    "secondary_owner": "backup.owner@company.com",
+    Recovery plan:
+    Dedicated review call at 2 PM.
+    """,
+        "status": "",
+        "summary": "",
+        "delay_reason": "",
+        "recovery_plan": "",
+        "expected_completion": "",
+        "warning": ""
+    }
 
-    "responsible_team": "database-team@company.com",
+    result = graph.invoke(initial_state)
 
-    "planned_percentage": 100,
-
-    "actual_percentage": 75,
-
-    "variance": 25,
-
-    "reply_text": """
-Task is 75% complete.
-
-Waiting for security approval.
-
-Expected completion by 5 PM.
-
-Recovery plan:
-Dedicated review call at 2 PM.
-""",
-
-    "status": "",
-
-    "completion_percentage": 0,
-
-    "summary": "",
-
-    "delay_reason": "",
-
-    "recovery_plan": "",
-
-    "expected_completion": "",
-
-    "warning": ""
-}
-
-result = graph.invoke(initial_state)
-
-print("\n===== FINAL STATE =====")
-
-for k, v in result.items():
-    print(k, ":", v)
+    print("\n===== FINAL STATE =====")
+    for k, v in result.items():
+        print(f"{k}: {v}")

@@ -7,6 +7,7 @@ import pandas as pd
 from sqlalchemy.orm import Session
 
 from app.models.models import Task, User, TaskStatus, UserRole
+from app.workspace.services.email_service import send_assignment_email
 
 logger = logging.getLogger("IngestionService")
 
@@ -26,12 +27,14 @@ class IngestionService:
             imported_count = 0
 
             for index, row in df.iterrows():
-                title = IngestionService._get_str(row, ["Task Name", "task_name"])
-                cancel_flag = IngestionService._get_str(row, ["Cancel Flag", "cancel_flag"])
-                if not title or str(cancel_flag).strip().lower() in {"true", "yes", "1"}:
+                # ADDED: "Task Name"
+                title = IngestionService._get_str(row, ["Task Name", "task_name", "Task", "Name"])
+                cancel_flag = IngestionService._get_str(row, ["Cancel Flag", "cancel_flag", "Canceled"])
+                if not title or str(cancel_flag).strip().lower() in {"true", "yes", "1", "y"}:
                     continue
 
-                assigned_email = IngestionService._get_str(row, ["Assigned To", "assigned_to"])
+                # ADDED: "Assigned To"
+                assigned_email = IngestionService._get_str(row, ["Assigned To", "assigned_to", "Owner Email", "Owner"])
                 if not assigned_email or "@" not in assigned_email:
                     logger.warning("Skipping row %s: invalid or missing Assigned To.", index)
                     continue
@@ -47,24 +50,26 @@ class IngestionService:
                     db.add(user)
                     db.flush()
 
-                secondary_owner_email = IngestionService._get_str(row, ["Secondary Owner", "secondary_owner"])
-                responsible_team = IngestionService._get_str(row, ["Responsible Team", "responsible_team"])
-                planned_percentage = IngestionService._parse_int(row, ["Planned Percentage", "planned_percentage"])
-                actual_percentage = IngestionService._parse_int(row, ["Actual Percentage", "actual_percentage"])
-                variance = IngestionService._parse_int(row, ["Variance", "variance"])
+                # ADDED: Specific Excel Column Names to all keys
+                secondary_owner_email = IngestionService._get_str(row, ["Secondary Owner", "secondary_owner", "Backup"])
+                responsible_team = IngestionService._get_str(row, ["Responsible Team", "responsible_team", "Team"])
+                
+                planned_percentage = IngestionService._parse_int(row, ["Planned % Complete", "Planned Percentage", "planned_percentage"])
+                actual_percentage = IngestionService._parse_int(row, ["Actual % Complete", "Actual Percentage", "actual_percentage"])
+                variance = IngestionService._parse_int(row, ["Variance", "variance", "Gap"])
                 completion_percentage = IngestionService._parse_int(row, ["Completion Percentage", "completion_percentage"])
 
                 if variance is None and planned_percentage is not None and actual_percentage is not None:
-                    variance = actual_percentage - planned_percentage
+                    variance = planned_percentage - actual_percentage
 
                 reply_text = IngestionService._get_str(row, ["Reply Text", "reply_text"])
                 summary = IngestionService._get_str(row, ["Summary", "summary"])
                 delay_reason = IngestionService._get_str(row, ["Delay Reason", "delay_reason"])
-                recovery_plan = IngestionService._get_str(row, ["Recovery Plan", "recovery_plan"])
-                warning_text = IngestionService._get_str(row, ["Warning", "warning"])
+                recovery_plan = IngestionService._get_str(row, ["Recovery", "Recovery Plan", "recovery_plan"])
+                warning_text = IngestionService._get_str(row, ["At Risk", "Warning", "warning"])
                 description = IngestionService._get_str(row, ["Description", "description"])
 
-                expected_completion = IngestionService._parse_datetime(row, ["Expected Completion", "expected_completion"])
+                expected_completion = IngestionService._parse_datetime(row, ["End Date", "Expected Completion", "expected_completion", "Deadline"])
                 deadline = expected_completion or datetime.utcnow().replace(tzinfo=timezone.utc)
 
                 status = IngestionService._normalize_status(
@@ -76,6 +81,7 @@ class IngestionService:
                     description=description,
                     status=status,
                     assigned_to=user.id,
+                    assigned_user=user, # 👈 FIX 1: Explicitly pass the SQLAlchemy relationship 
                     secondary_owner_email=secondary_owner_email,
                     responsible_team=responsible_team,
                     planned_percentage=planned_percentage,
@@ -91,6 +97,13 @@ class IngestionService:
                     deadline=deadline,
                 )
                 db.add(task)
+                
+                # 👈 FIX 2: Flush to the database immediately to generate the Task ID
+                db.flush() 
+                
+                # The email service will now correctly see task.id and task.assigned_user.email
+                send_assignment_email(task) 
+                
                 imported_count += 1
 
             db.commit()
@@ -114,6 +127,10 @@ class IngestionService:
         if value is None:
             return None
         try:
+            # Safely strip percentage signs (e.g., "85%" -> "85")
+            if isinstance(value, str):
+                value = value.replace("%", "").strip()
+            
             return int(float(value))
         except (ValueError, TypeError):
             logger.warning("Unable to parse integer value '%s' for keys %s.", value, keys)
