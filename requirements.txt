@@ -9,9 +9,9 @@ apscheduler==3.10.4
 streamlit==1.30.0
 pandas>=2.0.0
 openpyxl>=3.1.0
-langchain==0.1.20
-langchain-core==0.1.44
-langgraph==0.0.41
-langsmith==0.1.54
-langchain_google_genai==0.1.0
-google-generativeai==0.3.0
+langchain==0.2.5
+langchain-core==0.2.9
+langgraph==0.1.4
+langsmith==0.1.81
+langchain-google-genai==1.0.7
+google-generativeai==0.7.2
