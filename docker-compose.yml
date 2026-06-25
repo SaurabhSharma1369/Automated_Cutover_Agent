@@ -28,18 +28,19 @@ services:
       - db
     
   # streamlit is now at the same level as 'web' and 'db'
-  streamlit:
+  flask_dashboard:
     build: .
-    container_name: cutover_streamlit_demo
+    container_name: cutover_flask_dashboard
     restart: always
+    # 👇 This command tells python to run your new Flask file directly
+    command: python -m app.flask_dashboard
     ports:
-      - "8501:8501"
+      - "8502:8501"
     volumes:
       - .:/code
     environment:
       - DATABASE_URL=postgresql://postgres:password@db:5432/cutover_db
     depends_on:
       - db
-
 volumes:
   postgres_data:

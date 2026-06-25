@@ -17,3 +17,4 @@ langchain-google-genai>=1.0.10,<2.0.0
 langgraph>=0.0.41,<0.3.0
 langsmith
 google-generativeai
+flask==3.0.3
